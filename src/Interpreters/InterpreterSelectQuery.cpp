@@ -1061,6 +1061,7 @@ void InterpreterSelectQuery::executeFetchColumns(
 
     if (optimize_trivial_count)
     {
+        DUMP(storage);
         const auto & desc = query_analyzer->aggregates()[0];
         const auto & func = desc.function;
         std::optional<UInt64> num_rows = storage->totalRows();
@@ -1444,6 +1445,7 @@ void InterpreterSelectQuery::executeAggregation(QueryPlan & query_plan, const Ex
 
     SortDescription group_by_sort_description;
 
+    DUMP(group_by_info, settings.optimize_aggregation_in_order);
     if (group_by_info && settings.optimize_aggregation_in_order)
         group_by_sort_description = getSortDescriptionFromGroupBy(getSelectQuery());
     else

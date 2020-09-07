@@ -53,6 +53,8 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline)
     pipeline.dropTotalsAndExtremes();
 
     bool allow_to_use_two_level_group_by = pipeline.getNumStreams() > 1 || params.max_bytes_before_external_group_by != 0;
+    // DUMP(pipeline.getNumStreams(), params.max_bytes_before_external_group_by, allow_to_use_two_level_group_by, final, group_by_info);
+    // 4, 0, true, 1, null
     if (!allow_to_use_two_level_group_by)
     {
         params.group_by_two_level_threshold = 0;
@@ -68,6 +70,7 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline)
     if (group_by_info)
     {
         bool need_finish_sorting = (group_by_info->order_key_prefix_descr.size() < group_by_sort_description.size());
+        DUMP(need_finish_sorting);
 
         if (need_finish_sorting)
         {
@@ -127,6 +130,8 @@ void AggregatingStep::transformPipeline(QueryPipeline & pipeline)
     /// If there are several sources, then we perform parallel aggregation
     if (pipeline.getNumStreams() > 1)
     {
+        // DUMP(storage_has_evenly_distributed_read, pipeline.getNumStreams());
+        // 0, 4
         /// Add resize transform to uniformly distribute data between aggregating streams.
         if (!storage_has_evenly_distributed_read)
             pipeline.resize(pipeline.getNumStreams(), true, true);

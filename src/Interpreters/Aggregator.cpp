@@ -212,6 +212,7 @@ Aggregator::Aggregator(const Params & params_)
     //
     // pad_N will be used to match alignment requirement for each next state.
     // The address of state_1 is aligned based on maximum alignment requirements in states
+    LOG_TRACE(log, "new Aggregator params.aggregates_size: {}", params.aggregates_size);
     for (size_t i = 0; i < params.aggregates_size; ++i)
     {
         offsets_of_aggregate_states[i] = total_size_of_aggregate_states;
@@ -728,6 +729,8 @@ bool Aggregator::executeOnBlock(Columns columns, UInt64 num_rows, AggregatedData
     Columns materialized_columns;
 
     /// Remember the columns we will work with
+    if (params.keys_size != 1)
+        LOG_TRACE(log, "params.keys_size: {}", params.keys_size);
     for (size_t i = 0; i < params.keys_size; ++i)
     {
         materialized_columns.push_back(columns.at(params.keys[i])->convertToFullColumnIfConst());
@@ -799,12 +802,17 @@ bool Aggregator::executeOnBlock(Columns columns, UInt64 num_rows, AggregatedData
         result.convertToTwoLevel();
 
     /// Checking the constraints.
-    if (!checkLimits(result_size, no_more_keys))
+    if (!checkLimits(result_size, no_more_keys)) {
+        DUMP("return false");
         return false;
+    }
 
     /** Flush data to disk if too much RAM is consumed.
       * Data can only be flushed to disk if a two-level aggregation structure is used.
       */
+    if(params.max_bytes_before_external_group_by || result.isTwoLevel())
+        DUMP(result.isTwoLevel(), current_memory_usage, worth_convert_to_two_level);
+    //max_bytes_before_external_group_by=0,result.isTwoLevel()=0
     if (params.max_bytes_before_external_group_by
         && result.isTwoLevel()
         && current_memory_usage > static_cast<Int64>(params.max_bytes_before_external_group_by)
@@ -813,6 +821,7 @@ bool Aggregator::executeOnBlock(Columns columns, UInt64 num_rows, AggregatedData
         size_t size = current_memory_usage + params.min_free_disk_space;
 
         std::string tmp_path = params.tmp_volume->getDisk()->getPath();
+        DUMP(tmp_path);
 
         // enoughSpaceInDirectory() is not enough to make it right, since
         // another process (or another thread of aggregator) can consume all
@@ -2191,6 +2200,7 @@ void Aggregator::mergeStream(const BlockInputStreamPtr & stream, AggregatedDataV
 
 void Aggregator::mergeBlocks(BucketToBlocks bucket_to_blocks, AggregatedDataVariants & result, size_t max_threads)
 {
+    DUMP("mergeBlocks");
     if (bucket_to_blocks.empty())
         return;
 

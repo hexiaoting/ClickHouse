@@ -485,6 +485,7 @@ void Pipe::addSimpleTransform(const ProcessorGetterWithStreamKind & getter)
             return;
 
         auto transform = getter(port->getHeader(), stream_type);
+        // DUMP("#################addSimpleTransform:", transform->getName());
 
         if (transform)
         {
@@ -519,6 +520,7 @@ void Pipe::addSimpleTransform(const ProcessorGetterWithStreamKind & getter)
         }
     };
 
+    // DUMP("pipe: ", output_ports.size());
     for (auto & port : output_ports)
         add_transform(port, StreamType::Main);
 

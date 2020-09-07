@@ -159,7 +159,7 @@ class ConvertingAggregatedToChunksTransform : public IProcessor
 public:
     ConvertingAggregatedToChunksTransform(AggregatingTransformParamsPtr params_, ManyAggregatedDataVariantsPtr data_, size_t num_threads_)
         : IProcessor({}, {params_->getHeader()})
-        , params(std::move(params_)), data(std::move(data_)), num_threads(num_threads_) {}
+        , params(std::move(params_)), data(std::move(data_)), num_threads(num_threads_) {DUMP("new ConvertingAggregatedToChunksTransform");}
 
     String getName() const override { return "ConvertingAggregatedToChunksTransform"; }
 
@@ -406,6 +406,7 @@ AggregatingTransform::AggregatingTransform(
     , max_threads(std::min(many_data->variants.size(), max_threads_))
     , temporary_data_merge_threads(temporary_data_merge_threads_)
 {
+    // LOG_TRACE(log, "new AggregatingTransform {}", current_variant);
 }
 
 AggregatingTransform::~AggregatingTransform() = default;
@@ -415,6 +416,7 @@ IProcessor::Status AggregatingTransform::prepare()
     /// There are one or two input ports.
     /// The first one is used at aggregation step, the second one - while reading merged data from ConvertingAggregated
 
+    // DUMP("prepare");
     auto & output = outputs.front();
     /// Last output is current. All other outputs should already be closed.
     auto & input = inputs.back();
@@ -459,6 +461,7 @@ IProcessor::Status AggregatingTransform::prepare()
         else
         {
             /// Finish data processing and create another pipe.
+            DUMP("set is_consume_finished=true, return Ready");
             is_consume_finished = true;
             return Status::Ready;
         }
@@ -488,10 +491,14 @@ IProcessor::Status AggregatingTransform::prepare()
 
 void AggregatingTransform::work()
 {
-    if (is_consume_finished)
+
+    if (is_consume_finished) {
+        // LOG_TRACE(log, "start initGenerate");
         initGenerate();
+    }
     else
     {
+        // LOG_TRACE(log, "start consume");
         consume(std::move(current_chunk));
         read_current_chunk = false;
     }
@@ -521,9 +528,13 @@ void AggregatingTransform::consume(Chunk chunk)
 
     src_rows += chunk.getNumRows();
     src_bytes += chunk.bytes();
+    // LOG_TRACE(log, "num_rows={}, src_rows={}", num_rows, src_rows);
+    // DUMP(key_columns);
 
-    if (!params->aggregator.executeOnBlock(chunk.detachColumns(), num_rows, variants, key_columns, aggregate_columns, no_more_keys))
+    if (!params->aggregator.executeOnBlock(chunk.detachColumns(), num_rows, variants, key_columns, aggregate_columns, no_more_keys)) {
+        DUMP("set is_consume_finished= true");
         is_consume_finished = true;
+    }
 }
 
 void AggregatingTransform::initGenerate()
@@ -548,6 +559,7 @@ void AggregatingTransform::initGenerate()
 
     if (params->aggregator.hasTemporaryFiles())
     {
+        DUMP("hasTemp");
         if (variants.isConvertibleToTwoLevel())
             variants.convertToTwoLevel();
 
@@ -564,6 +576,7 @@ void AggregatingTransform::initGenerate()
         auto prepared_data = params->aggregator.prepareVariantsToMerge(many_data->variants);
         auto prepared_data_ptr = std::make_shared<ManyAggregatedDataVariants>(std::move(prepared_data));
         processors.emplace_back(std::make_shared<ConvertingAggregatedToChunksTransform>(params, std::move(prepared_data_ptr), max_threads));
+        DUMP("new ConvertingAggregatedToChunksTransform", max_threads);
     }
     else
     {
