@@ -51,6 +51,7 @@ enum class TypeIndex
     Function,
     AggregateFunction,
     LowCardinality,
+    Map,
 };
 
 /// defined in common/types.h
@@ -259,6 +260,7 @@ inline constexpr const char * getTypeName(TypeIndex idx)
         case TypeIndex::Function:   return "Function";
         case TypeIndex::AggregateFunction: return "AggregateFunction";
         case TypeIndex::LowCardinality: return "LowCardinality";
+        case TypeIndex::Map:        return "Map";
     }
 
     __builtin_unreachable();
