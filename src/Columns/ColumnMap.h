@@ -1,35 +1,48 @@
 #pragma once
 
-#include <Core/Block.h>
+#include <Columns/IColumn.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnTuple.h>
+
+#include <memory>
 
 namespace DB
 {
 
-/** Column, that is just group of 2 columns.
-  *
-  */
+class Field;
+
+/** Column, that stores a nested Array(Tuple(key, value)) column.
+ */
 class ColumnMap final : public COWHelper<IColumn, ColumnMap>
 {
+public:
+    class IIndex;
+
 private:
     friend class COWHelper<IColumn, ColumnMap>;
 
-    using MapColumns = std::vector<WrappedPtr>;
-    MapColumns columns;
+    WrappedPtr nested;
+    mutable std::shared_ptr<IIndex> key_index;
 
-    template <bool positive>
-    struct Less;
-
-    explicit ColumnMap(MutableColumns && columns);
-    ColumnMap(const ColumnMap &) = default;
+    explicit ColumnMap(MutableColumnPtr && nested_);
+    ColumnMap(const ColumnMap &);
 
 public:
+    ~ColumnMap() override;
+
     /** Create immutable column using immutable arguments. This arguments may be shared with other columns.
       * Use IColumn::mutate in order to make mutable column and mutate shared nested columns.
       */
     using Base = COWHelper<IColumn, ColumnMap>;
-    static Ptr create(const Columns & columns);
-    static Ptr create(const MapColumns & columns);
-    static Ptr create(Columns && arg) { return create(arg); }
+
+    static Ptr create(const ColumnPtr & keys, const ColumnPtr & values, const ColumnPtr & offsets)
+    {
+        auto nested_column = ColumnArray::create(ColumnTuple::create(Columns{keys, values}), offsets);
+        return ColumnMap::create(nested_column);
+    }
+
+    static Ptr create(const ColumnPtr & column) { return ColumnMap::create(column->assumeMutable()); }
+    static Ptr create(ColumnPtr && arg) { return create(arg); }
 
     template <typename Arg, typename = typename std::enable_if<std::is_rvalue_reference<Arg &&>::value>::type>
     static MutablePtr create(Arg && arg) { return Base::create(std::forward<Arg>(arg)); }
@@ -41,10 +54,7 @@ public:
     MutableColumnPtr cloneEmpty() const override;
     MutableColumnPtr cloneResized(size_t size) const override;
 
-    size_t size() const override
-    {
-        return columns.at(0)->size();
-    }
+    size_t size() const override { return nested->size(); }
 
     Field operator[](size_t n) const override;
     void get(size_t n, Field & res) const override;
@@ -75,18 +85,27 @@ public:
     void updatePermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_range) const override;
     void reserve(size_t n) override;
     size_t byteSize() const override;
+    size_t byteSizeAt(size_t n) const override;
     size_t allocatedBytes() const override;
     void protect() override;
     void forEachSubcolumn(ColumnCallback callback) override;
     bool structureEquals(const IColumn & rhs) const override;
 
-    const IColumn & getColumn(size_t idx) const { return *columns[idx]; }
-    IColumn & getColumn(size_t idx) { return *columns[idx]; }
+    const ColumnArray & getNestedColumn() const { return assert_cast<const ColumnArray &>(*nested); }
+    const ColumnTuple & getNestedData() const { return assert_cast<const ColumnTuple &>(getNestedColumn().getData()); }
 
-    const MapColumns & getColumns() const { return columns; }
-    Columns getColumnsCopy() const { return {columns.begin(), columns.end()}; }
+    /// In order for findAll to continue to work, make sure you call rebuildIndex() after modifying column's contents from outside.
+    ColumnArray & getNestedColumn() { return assert_cast<ColumnArray &>(*nested); }
+    ColumnTuple & getNestedData() { return assert_cast<ColumnTuple &>(getNestedColumn().getData()); }
 
-    const ColumnPtr & getColumnPtr(size_t idx) const { return columns[idx]; }
+    // Rebuilds and index for finaAll(), non thread-safe.
+    void rebuildIndex();
+
+    // Find all keys from `keys` column and return equally sized Column of values.
+    ColumnPtr findAll(const IColumn & keys, size_t rows_count) const;
+
+private:
+    bool rebuildIndexDueToCOW();
 };
 
 }

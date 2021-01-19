@@ -24,6 +24,7 @@ namespace DB
 class ColumnString final : public COWHelper<IColumn, ColumnString>
 {
 public:
+    using ValueType = StringRef;
     using Char = UInt8;
     using Chars = PaddedPODArray<UInt8>;
 
@@ -69,6 +70,12 @@ public:
     size_t byteSize() const override
     {
         return chars.size() + offsets.size() * sizeof(offsets[0]);
+    }
+
+    size_t byteSizeAt(size_t n) const override
+    {
+        assert(n < size());
+        return sizeAt(n) + sizeof(offsets[0]);
     }
 
     size_t allocatedBytes() const override
@@ -273,6 +280,11 @@ public:
 
     Offsets & getOffsets() { return offsets; }
     const Offsets & getOffsets() const { return offsets; }
+
+    ValueType getElement(size_t n) const
+    {
+        return getDataAt(n);
+    }
 
     // Throws an exception if offsets/chars are messed up
     void validate() const;

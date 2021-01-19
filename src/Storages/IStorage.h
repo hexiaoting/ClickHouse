@@ -78,7 +78,7 @@ struct ColumnSize
   * - data storage structure (compression, etc.)
   * - concurrent access to data (locks, etc.)
   */
-class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromotion<IStorage>
+class IStorage : public std::enable_shared_from_this<IStorage>, public TypePromotion<IStorage>, public IHints<1, IStorage>
 {
 public:
     IStorage() = delete;
@@ -87,7 +87,6 @@ public:
         : storage_id(std::move(storage_id_))
         , metadata(std::make_unique<StorageInMemoryMetadata>()) {} //-V730
 
-    virtual ~IStorage() = default;
     IStorage(const IStorage &) = delete;
     IStorage & operator=(const IStorage &) = delete;
 
@@ -120,9 +119,6 @@ public:
 
     /// Returns true if the storage supports deduplication of inserted data blocks.
     virtual bool supportsDeduplication() const { return false; }
-
-    /// Returns true if the storage supports settings.
-    virtual bool supportsSettings() const { return false; }
 
     /// Returns true if the blocks shouldn't be pushed to associated views on insert.
     virtual bool noPushingToViews() const { return false; }
@@ -169,6 +165,7 @@ public:
     /// By default return empty list of columns.
     virtual NamesAndTypesList getVirtuals() const;
 
+    Names getAllRegisteredNames() const override;
 protected:
 
     /// Returns whether the column is virtual - by default all columns are real.
@@ -380,6 +377,7 @@ public:
         const ASTPtr & /*partition*/,
         bool /*final*/,
         bool /*deduplicate*/,
+        const Names & /* deduplicate_by_columns */,
         const Context & /*context*/)
     {
         throw Exception("Method optimize is not supported by storage " + getName(), ErrorCodes::NOT_IMPLEMENTED);
@@ -463,7 +461,7 @@ public:
     /// - For total_rows column in system.tables
     ///
     /// Does takes underlying Storage (if any) into account.
-    virtual std::optional<UInt64> totalRows() const { return {}; }
+    virtual std::optional<UInt64> totalRows(const Settings &) const { return {}; }
 
     /// Same as above but also take partition predicate into account.
     virtual std::optional<UInt64> totalRowsByPartitionPredicate(const SelectQueryInfo &, const Context &) const { return {}; }
@@ -481,7 +479,7 @@ public:
     /// Memory part should be estimated as a resident memory size.
     /// In particular, alloctedBytes() is preferable over bytes()
     /// when considering in-memory blocks.
-    virtual std::optional<UInt64> totalBytes() const { return {}; }
+    virtual std::optional<UInt64> totalBytes(const Settings &) const { return {}; }
 
     /// Number of rows INSERTed since server start.
     ///

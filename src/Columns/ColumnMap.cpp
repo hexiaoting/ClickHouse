@@ -1,15 +1,30 @@
 #include <Columns/ColumnMap.h>
+
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnConst.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnFixedString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/IColumnImpl.h>
+#include <Common/ArenaWithFreeLists.h>
+#include <Common/HashTable/HashMap.h>
+#include <Common/HashTable/StringHashMap.h>
+#include <Common/WeakHash.h>
+#include <Common/assert_cast.h>
+#include <Common/typeid_cast.h>
+#include <Core/Field.h>
 #include <DataStreams/ColumnGathererStream.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/Operators.h>
+#include <IO/WriteBufferFromString.h>
+
 #include <ext/map.h>
 #include <ext/range.h>
-#include <Common/typeid_cast.h>
-#include <Common/assert_cast.h>
-#include <Common/WeakHash.h>
-#include <Core/Field.h>
 
+#include <Common/Stopwatch.h>
+#include <common/logger_useful.h>
+
+#include <boost/smart_ptr/make_shared.hpp>
 
 namespace DB
 {
@@ -18,85 +33,494 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
     extern const int NOT_IMPLEMENTED;
-    extern const int CANNOT_INSERT_VALUE_OF_DIFFERENT_SIZE_INTO_TUPLE;
     extern const int LOGICAL_ERROR;
+    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int ARGUMENT_OUT_OF_BOUND;
 }
 
+class ColumnMap::IIndex
+{
+public:
+    virtual ~IIndex() = default;
+
+    virtual IColumn::Ptr findAll(const IColumn & needles, size_t rows_count) const = 0;
+
+    // updates the index with N last rows of the key/value columns.
+    virtual void afterAppend(size_t N) = 0;
+    virtual void afterRemove(size_t N) = 0;
+    virtual bool needsRebuild(const IColumn & keys, const IColumn & values, const ColumnArray::Offsets & offsets) const = 0;
+
+    // Completely rebuilds an index.
+    virtual void rebuild() = 0;
+};
+
+}
+
+namespace
+{
+using namespace DB;
+
+const auto * logger()
+{
+    static const auto & logger = Poco::Logger::get("ColumnMap");
+    return &logger;
+}
+
+template <typename SharedAllocator>
+struct ShareableAllocator
+{
+    SharedAllocator * shared_allocator = nullptr;
+
+    inline void * alloc(size_t size, size_t /*alignment*/ = 0)
+    {
+        return shared_allocator->alloc(size);
+//        LOG_DEBUG(logger(), "arena allocated 0x{} ({} bytes)", reinterpret_cast<const void*>(res), size);
+//        return res;
+    }
+
+    /// Free memory range.
+    inline void free(void * buf, size_t size)
+    {
+        shared_allocator->free(reinterpret_cast<char *>(buf), size);
+//        LOG_DEBUG(logger(), "arena freed 0x{} ({} bytes)", buf, size);
+    }
+
+    inline void * realloc(void * buf, size_t old_size, size_t new_size, size_t alignment = 0)
+    {
+        return shared_allocator->realloc(buf, old_size, new_size, alignment);
+//        LOG_DEBUG(logger(), "arena re-allocated 0x{} ({} bytes) into 0x{} ({} bytes)", buf, old_size, res, new_size);
+//        return res;
+    }
+};
+
+template <typename KeyColumnType, typename KeyStorageType>
+class ColumnMapIndex : public ColumnMap::IIndex
+{
+    // Columns are max 0xFFFF items, so array on each row is max 0xFFFF items long, which is more than enough.
+    using MappedType = UInt32;
+
+    template <typename KeyType, typename AllocatorType>
+    using HashMapTypeSelector = std::conditional_t<std::is_same_v<KeyType, StringRef>,
+        StringHashMap<MappedType, AllocatorType>,
+        HashMap<KeyStorageType, MappedType, DefaultHash<KeyStorageType>, HashTableGrower<>, AllocatorType>
+    >;
+
+    using ArenaAllocator = GenericArenaWithFreeLists<true, true>;
+    using ShareableAllocator = ShareableAllocator<ArenaAllocator>;
+    using HashMapType = HashMapTypeSelector<typename KeyColumnType::ValueType, ShareableAllocator>;
+
+    const KeyColumnType & keys_column;
+    const IColumn & values_column;
+    const ColumnArray::Offsets & row_offsets;
+    ArenaAllocator arena;
+
+    // One hashtables per row is much more performant (less collisions)
+    // than one huge HT and much more convenient in terms of building keys - no need to mess with
+    // compound (row+key_value) keys and inventing hash functions.
+    std::vector<HashMapType> hash_tables;
+
+    mutable std::atomic<size_t> find_queries = 0;
+    mutable std::atomic<size_t> lookup_hits = 0;
+    mutable std::atomic<size_t> lookup_misses = 0;
+    mutable std::atomic<size_t> find_total_microseconds = 0;
+    mutable std::atomic<size_t> index_rebuilds = 0;
+    mutable std::atomic<size_t> index_rebuilds_microseconds = 0;
+    mutable std::atomic<size_t> items_added = 0;
+    mutable std::atomic<size_t> items_removed = 0;
+
+public:
+    static constexpr size_t min_arena_size = 4096;
+    // Memory pre-allocated for an Arena = (total required memory for all keys and hashtable cells) * arena_size_factor.
+    // arbitrary value > 1 (since HashTables operate good only when there is substantial free memory).
+    static constexpr auto arena_size_factor = 2;
+
+    ColumnMapIndex(const IColumn & keys_column_, const IColumn & values_column_, const ColumnArray::Offsets & offsets_)
+        : ColumnMapIndex(*assert_cast<const KeyColumnType*>(&keys_column_), values_column_, offsets_)
+    {}
+
+    ColumnMapIndex(const KeyColumnType & keys_column_, const IColumn & values_column_, const ColumnArray::Offsets & offsets_)
+        : keys_column(keys_column_)
+        , values_column(values_column_)
+        , row_offsets(offsets_)
+        , arena(std::max<size_t>(min_arena_size, (keys_column.size() * sizeof(typename HashMapType::cell_type) + keys_column_.byteSize()) * arena_size_factor))
+    {
+        LOG_DEBUG(logger(), "Index({} => {}) 0x{} Constructing index, initial arena size: {}"
+                , keys_column.getName(), values_column.getName(), static_cast<const void*>(this)
+                , arena.size());
+
+        addRowsToIndex(0, row_offsets.size());
+    }
+
+    ~ColumnMapIndex() override
+    {
+        if (!hash_tables.empty() || find_queries > 0)
+        {
+            LOG_DEBUG(logger(), "Index({} => {}) 0x{} Destroying index, final stats"
+                    "\n\thashtables                  : {}"
+                    "\n\ttotal keys                  : {}"
+                    "\n\ttotal find queries          : {}"
+                    "\n\t   key lookup hits          : {}"
+                    "\n\t   key lookup misses        : {}"
+                    "\n\ttotal find time             : {}us"
+                    "\n\tavg find time               : {}us per find query"
+                    "\n\tavg lookup time             : {}us per lookup"
+                    "\n\tavg lookups                 : {} per find query"
+                    "\n\ttotal index full rebuilds   : {}"
+                    "\n\tavg index full rebuild time : {}us per full rebuild"
+                    "\n\ttotal items added           : {}"
+                    "\n\ttotal items removed         : {}"
+                    , keys_column.getName(), values_column.getName(), static_cast<const void*>(this)
+                    , hash_tables.size()
+                    , keys_column.size()
+                    , find_queries
+                    , lookup_hits
+                    , lookup_misses
+                    , find_total_microseconds
+                    , static_cast<double>(find_total_microseconds) / find_queries
+                    , static_cast<double>(find_total_microseconds) / (lookup_hits + lookup_misses)
+                    , static_cast<double>(lookup_hits + lookup_misses) / find_queries
+                    , index_rebuilds
+                    , static_cast<double>(index_rebuilds_microseconds) / index_rebuilds
+                    , items_added
+                    , items_removed);
+        }
+    }
+
+    // updates the index with N last rows of the key/value columns.
+    void afterAppend(size_t number_of_rows) override
+    {
+        addRowsToIndex(row_offsets.size() - number_of_rows, row_offsets.size());
+        items_added += number_of_rows;
+    }
+
+    void afterRemove(size_t number_of_rows) override
+    {
+        hash_tables.erase(hash_tables.end() - number_of_rows, hash_tables.end());
+        items_removed += number_of_rows;
+    }
+
+    bool needsRebuild(const IColumn & keys, const IColumn & values, const ColumnArray::Offsets & offsets_) const override
+    {
+        return &keys != &keys_column || &values != &values_column || &offsets_ != &row_offsets;
+    }
+
+    // Completely rebuilds an index.
+    void rebuild() override
+    {
+        Stopwatch stopwatch;
+        stopwatch.start();
+
+        addRowsToIndex(0, row_offsets.size());
+
+        index_rebuilds_microseconds += stopwatch.elapsedMicroseconds();
+        ++index_rebuilds;
+    }
+
+    void addRowsToIndex(size_t start_row, size_t end_row)
+    {
+//        LOG_DEBUG(logger(), "Index({} => {}) 0x{} Adding items to index: {} to {} on column with {}:{}:{} items"
+//                  "\n\tkeys col: {}, vals col: {}, offsets: {}"
+//                  , keys_column.getName(), values_column.getName(), static_cast<const void*>(this)
+//                  , start_row, end_row
+//                  , keys_column.size(), values_column.size(), row_offsets.size()
+//                  , reinterpret_cast<const void*>(&keys_column)
+//                  , reinterpret_cast<const void*>(&values_column)
+//                  , reinterpret_cast<const void*>(&row_offsets));
+
+        hash_tables.reserve(hash_tables.size() + end_row - start_row);
+
+        // Build an index, store global key offset as mapped values since that greatly simplifies value extraction.
+        size_t starting_offset = start_row == 0 ? 0 : row_offsets[start_row - 1];
+        size_t total_items = 0;
+
+        for (size_t row = start_row; row < end_row; ++row)
+        {
+            const size_t final_offset = row_offsets[row];
+
+            HashMapType map(ShareableAllocator{&arena});
+
+            if constexpr (!std::is_same_v<KeyStorageType, StringRef>)
+            {
+                map.reserve(final_offset - starting_offset);
+            }
+
+            for (size_t i = starting_offset; i < final_offset; ++i)
+            {
+                typename HashMapType::LookupResult it;
+                bool inserted;
+                // Casting allows narrower types like UInt8 and UInt16 to be matched against UInt64,
+                // i.e. UInt64(1) and UInt8(1) would have same hash.
+                map.emplace(static_cast<KeyStorageType>(keys_column.getElement(i)), it, inserted);
+                if (inserted)
+                    it->getMapped() = static_cast<MappedType>(i);
+            }
+            total_items += final_offset - starting_offset;
+            starting_offset = final_offset;
+
+            hash_tables.emplace_back(std::move(map));
+        }
+    }
+
+    template <typename NeedleColumnType>
+    struct VectorColumnValueExtractor
+    {
+        const NeedleColumnType & needle_col;
+
+        explicit VectorColumnValueExtractor(const NeedleColumnType & needle_col_)
+            : needle_col(needle_col_)
+        {}
+
+        inline KeyStorageType getElement(size_t row) const
+        {
+            return needle_col.getElement(row);
+        }
+    };
+
+    template <typename NeedleColumnType>
+    struct ConstColumnValueExtractor
+    {
+        const KeyStorageType value;
+        explicit ConstColumnValueExtractor(const NeedleColumnType & needle_col)
+            : value(static_cast<KeyStorageType>(needle_col.getElement(0)))
+        {}
+
+        inline KeyStorageType getElement(size_t /*row*/) const
+        {
+            return value;
+        }
+    };
+
+    IColumn::Ptr findAll(const IColumn & needles, size_t rows_count) const override
+    {
+        if (needles.size() > hash_tables.size())
+            throw Exception(fmt::format("There are more needles ({}) than rows in index ({})", needles.size(), hash_tables.size()),
+                ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+
+        if (const auto * needles_column = checkAndGetColumn<ColumnConst>(needles))
+        {
+            auto find_const = [this](const auto & typed_needles_column, size_t rows_count_) -> auto
+            {
+                return this->findAllTyped<ConstColumnValueExtractor>(typed_needles_column, rows_count_);
+            };
+            return findDispatch(find_const, needles_column->getDataColumn(), rows_count);
+        }
+        else
+        {
+            auto find_vector = [this](const auto & typed_needles_column, size_t rows_count_) -> auto
+            {
+                return this->findAllTyped<VectorColumnValueExtractor>(typed_needles_column, rows_count_);
+            };
+            return findDispatch(find_vector, needles, rows_count);
+        }
+    }
+
+    template <typename FindFunction>
+    IColumn::Ptr findDispatch(FindFunction find_function, const IColumn & needles, size_t rows_count) const
+    {
+        if constexpr (std::is_same_v<KeyStorageType, StringRef>)
+        {
+            if (const auto * needles_column = checkAndGetColumn<ColumnString>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnFixedString>(needles))
+                return find_function(*needles_column, rows_count);
+        }
+        else //if constexpr (std::is_unsigned_v<KeyStorageType>)
+        {
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<UInt8>>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<UInt16>>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<UInt32>>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<UInt64>>(needles))
+                return find_function(*needles_column, rows_count);
+//        }
+//        else if constexpr (std::is_signed_v<KeyStorageType>)
+//        {
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<Int8>>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<Int16>>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<Int32>>(needles))
+                return find_function(*needles_column, rows_count);
+            if (const auto * needles_column = checkAndGetColumn<ColumnVector<Int64>>(needles))
+                return find_function(*needles_column, rows_count);
+        }
+
+        throw Exception(fmt::format("Unsupported needle type for Map: {} expected {}",
+                needles.getName(), keys_column.getName()),
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+
+    template <template <typename> typename ValueExtractor, typename NeedleColumnType>
+    IColumn::Ptr findAllTyped(const NeedleColumnType & needles, size_t rows_count) const
+    {
+        const ValueExtractor<NeedleColumnType> values(needles);
+
+        ++find_queries;
+
+        size_t misses = 0;
+        size_t hits = 0;
+
+        auto result = values_column.cloneEmpty();
+        result->reserve(needles.size());
+
+        Stopwatch stopwatch;
+        stopwatch.start();
+
+        for (size_t row = 0; row < rows_count; ++row)
+        {
+            auto res = hash_tables[row].find(static_cast<KeyStorageType>(values.getElement(row)));
+            if (res)
+            {
+                result->insertFrom(values_column, res->getMapped());
+                ++hits;
+            }
+            else
+            {
+                result->insertDefault();
+                ++misses;
+            }
+        }
+
+        stopwatch.stop();
+        find_total_microseconds += stopwatch.elapsedMicroseconds();
+        lookup_hits += hits;
+        lookup_misses += misses;
+        return result;
+    }
+};
+
+const IColumn & stripNullable(const IColumn & col)
+{
+    if (const auto * nullable_keys = checkAndGetColumn<ColumnNullable>(col))
+        return nullable_keys->getNestedColumn();
+
+    return col;
+}
+
+std::shared_ptr<ColumnMap::IIndex> makeIndex(const IColumn & keys_column, const IColumn & values_column, const ColumnArray::Offsets & offsets)
+{
+    switch (keys_column.getDataType())
+    {
+        case TypeIndex::UInt8:
+            return std::make_shared<ColumnMapIndex<ColumnVector<UInt8>, UInt64>>(keys_column, values_column, offsets);
+        case TypeIndex::UInt16:
+            return std::make_shared<ColumnMapIndex<ColumnVector<UInt16>, UInt64>>(keys_column, values_column, offsets);
+        case TypeIndex::UInt32:
+            return std::make_shared<ColumnMapIndex<ColumnVector<UInt32>, UInt64>>(keys_column, values_column, offsets);
+        case TypeIndex::UInt64:
+            return std::make_shared<ColumnMapIndex<ColumnVector<UInt64>, UInt64>>(keys_column, values_column, offsets);
+////        case TypeIndex::UInt128:
+////            return std::make_shared<ColumnMapIndex<ColumnVector<UInt128>, UInt128>>(keys_column, values_column, offsets);
+////        case TypeIndex::UInt256:
+        case TypeIndex::Int8:
+            return std::make_shared<ColumnMapIndex<ColumnVector<Int8>, Int64>>(keys_column, values_column, offsets);
+        case TypeIndex::Int16:
+            return std::make_shared<ColumnMapIndex<ColumnVector<Int16>, Int64>>(keys_column, values_column, offsets);
+        case TypeIndex::Int32:
+            return std::make_shared<ColumnMapIndex<ColumnVector<Int32>, Int64>>(keys_column, values_column, offsets);
+        case TypeIndex::Int64:
+            return std::make_shared<ColumnMapIndex<ColumnVector<Int64>, Int64>>(keys_column, values_column, offsets);
+////        case TypeIndex::Int128:
+////        case TypeIndex::Int256:
+// TODO: since most of Floats are not going to be binary equal, it might not make any sense to store those in a hashmap
+//        case TypeIndex::Float32:
+//            return std::make_shared<ColumnMapIndex<ColumnVector<Float32>, Float64>>(keys_column, values_column, offsets);
+//        case TypeIndex::Float64:
+//            return std::make_shared<ColumnMapIndex<ColumnVector<Float64>, Float64>>(keys_column, values_column, offsets);
+////        case TypeIndex::Date:
+////        case TypeIndex::DateTime:
+////        case TypeIndex::DateTime64:
+        case TypeIndex::String:
+            return std::make_shared<ColumnMapIndex<ColumnString, StringRef>>(keys_column, values_column, offsets);
+        case TypeIndex::FixedString:
+            return std::make_shared<ColumnMapIndex<ColumnFixedString, StringRef>>(keys_column, values_column, offsets);
+        case TypeIndex::Enum8:
+            return std::make_shared<ColumnMapIndex<ColumnVector<Int8>, Int64>>(keys_column, values_column, offsets);
+        case TypeIndex::Enum16:
+            return std::make_shared<ColumnMapIndex<ColumnVector<Int16>, Int64>>(keys_column, values_column, offsets);
+////        case TypeIndex::Decimal32:
+////        case TypeIndex::Decimal64:
+////        case TypeIndex::Decimal128:
+////        case TypeIndex::Decimal256:
+////        case TypeIndex::UUID:
+    default:
+        throw Exception("Unsupported KEY column of Map " + keys_column.getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+    }
+}
+
+}
+
+namespace DB
+{
 
 std::string ColumnMap::getName() const
 {
     WriteBufferFromOwnString res;
-    res << "Map(" << columns[0]->getName() << ", " << columns[1]->getName() << ")";
+    const auto & nested_tuple = getNestedData();
+    res << "Map(" << nested_tuple.getColumn(0).getName()
+        << ", " << nested_tuple.getColumn(1).getName() << ")";
+
     return res.str();
 }
 
-ColumnMap::ColumnMap(MutableColumns && mutable_columns)
+ColumnMap::ColumnMap(MutableColumnPtr && nested_)
+    : nested(std::move(nested_))
 {
-    columns.reserve(mutable_columns.size());
-    for (auto & column : mutable_columns)
-    {
-        assert(column->getDataType() == TypeIndex::Array);
-        if (isColumnConst(*column))
-            throw Exception{"ColumnMap cannot have ColumnConst as its element", ErrorCodes::ILLEGAL_COLUMN};
+    const auto * column_array = typeid_cast<const ColumnArray *>(nested.get());
+    if (!column_array)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ColumnMap can be created only from array of tuples");
 
-        columns.push_back(std::move(column));
-    }
+    const auto * column_tuple = typeid_cast<const ColumnTuple *>(column_array->getDataPtr().get());
+    if (!column_tuple)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ColumnMap can be created only from array of tuples");
+
+    if (column_tuple->getColumns().size() != 2)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ColumnMap should contain only 2 subcolumns: keys and values");
+
+    for (const auto & column : column_tuple->getColumns())
+        if (isColumnConst(*column))
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "ColumnMap cannot have ColumnConst as its element");
+
+    rebuildIndex();
 }
 
-ColumnMap::Ptr ColumnMap::create(const Columns & columns)
-{
-    for (const auto & column : columns)
-        if (isColumnConst(*column))
-            throw Exception{"ColumnMap cannot have ColumnConst as its element", ErrorCodes::ILLEGAL_COLUMN};
+ColumnMap::ColumnMap(const ColumnMap & other)
+    : Base(other),
+      nested(other.nested),
+      key_index(other.key_index) // share an index and re-build it when nested columns changed by COW.
+{}
 
-    auto column_map = ColumnMap::create(MutableColumns());
-    column_map->columns.assign(columns.begin(), columns.end());
-
-    return column_map;
-}
-
-ColumnMap::Ptr ColumnMap::create(const MapColumns & columns)
-{
-    for (const auto & column : columns)
-        if (isColumnConst(*column))
-            throw Exception{"ColumnMap cannot have ColumnConst as its element", ErrorCodes::ILLEGAL_COLUMN};
-
-    auto column_map = ColumnMap::create(MutableColumns());
-    column_map->columns = columns;
-
-    return column_map;
-}
+ColumnMap::~ColumnMap() = default;
 
 MutableColumnPtr ColumnMap::cloneEmpty() const
 {
-    MutableColumns new_columns(2);
-    for (size_t i = 0; i < 2; ++i)
-        new_columns[i] = columns[i]->cloneEmpty();
-
-    return ColumnMap::create(std::move(new_columns));
+    return ColumnMap::create(nested->cloneEmpty());
 }
 
 MutableColumnPtr ColumnMap::cloneResized(size_t new_size) const
 {
-    MutableColumns new_columns(2);
-    for (size_t i = 0; i < 2; ++i)
-        new_columns[i] = columns[i]->cloneResized(new_size);
-
-    return ColumnMap::create(std::move(new_columns));
+    return ColumnMap::create(nested->cloneResized(new_size));
 }
 
 Field ColumnMap::operator[](size_t n) const
 {
-    return ext::map<Map>(columns, [n] (const auto & column) { return (*column)[n]; });
+    auto array = DB::get<Array>((*nested)[n]);
+    return Map(std::make_move_iterator(array.begin()), std::make_move_iterator(array.end()));
 }
 
 void ColumnMap::get(size_t n, Field & res) const
 {
-    Map map(2);
-    columns[0]->get(n, map[0]);
-    columns[1]->get(n, map[1]);
+    const auto & offsets = getNestedColumn().getOffsets();
+    size_t offset = offsets[n - 1];
+    size_t size = offsets[n] - offsets[n - 1];
 
-    res = map;
+    res = Map(size);
+    auto & map = DB::get<Map &>(res);
+
+    for (size_t i = 0; i < size; ++i)
+        getNestedData().get(offset + i, map[i]);
 }
 
 StringRef ColumnMap::getDataAt(size_t) const
@@ -112,145 +536,106 @@ void ColumnMap::insertData(const char *, size_t)
 void ColumnMap::insert(const Field & x)
 {
     const auto & map = DB::get<const Map &>(x);
+    nested->insert(Array(map.begin(), map.end()));
 
-    if (map.size() != 2)
-        throw Exception("Cannot insert value of different size into map", ErrorCodes::CANNOT_INSERT_VALUE_OF_DIFFERENT_SIZE_INTO_TUPLE);
-
-    for (size_t i = 0; i < 2; ++i)
-        columns[i]->insert(map[i]);
+    if (!rebuildIndexDueToCOW())
+        key_index->afterAppend(1);
 }
 
 void ColumnMap::insertDefault()
 {
-    for (auto & column : columns)
-        column->insertDefault();
+    nested->insertDefault();
+
+    if (!rebuildIndexDueToCOW())
+        key_index->afterAppend(1);
 }
+
 void ColumnMap::popBack(size_t n)
 {
-    for (auto & column : columns)
-        column->popBack(n);
+    LOG_DEBUG(logger(), "{} : {}", reinterpret_cast<const void*>(this), __FUNCTION__);
+    nested->popBack(n);
+
+    if (!rebuildIndexDueToCOW())
+        key_index->afterRemove(n);
 }
 
 StringRef ColumnMap::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const
 {
-    StringRef res(begin, 0);
-    for (const auto & column : columns)
-    {
-        auto value_ref = column->serializeValueIntoArena(n, arena, begin);
-        res.data = value_ref.data - res.size;
-        res.size += value_ref.size;
-    }
-
-    return res;
+    return nested->serializeValueIntoArena(n, arena, begin);
 }
 
 const char * ColumnMap::deserializeAndInsertFromArena(const char * pos)
 {
-    for (auto & column : columns)
-        pos = column->deserializeAndInsertFromArena(pos);
+    const char * result = nested->deserializeAndInsertFromArena(pos);
+    rebuildIndex();
 
-    return pos;
+    return result;
 }
 
 void ColumnMap::updateHashWithValue(size_t n, SipHash & hash) const
 {
-    for (const auto & column : columns)
-        column->updateHashWithValue(n, hash);
+    nested->updateHashWithValue(n, hash);
 }
 
 void ColumnMap::updateWeakHash32(WeakHash32 & hash) const
 {
-    auto s = size();
-
-    if (hash.getData().size() != s)
-        throw Exception("Size of WeakHash32 does not match size of column: column size is " + std::to_string(s) +
-                        ", hash size is " + std::to_string(hash.getData().size()), ErrorCodes::LOGICAL_ERROR);
-
-    for (const auto & column : columns)
-        column->updateWeakHash32(hash);
+    nested->updateWeakHash32(hash);
 }
 
 void ColumnMap::updateHashFast(SipHash & hash) const
 {
-    for (const auto & column : columns)
-        column->updateHashFast(hash);
+    nested->updateHashFast(hash);
 }
 
 void ColumnMap::insertRangeFrom(const IColumn & src, size_t start, size_t length)
 {
-    for (size_t i = 0; i < 2; ++i)
-        columns[i]->insertRangeFrom(
-            *assert_cast<const ColumnMap &>(src).columns[i],
-            start, length);
+    nested->insertRangeFrom(
+        assert_cast<const ColumnMap &>(src).getNestedColumn(),
+        start, length);
+
+    if (!rebuildIndexDueToCOW())
+        key_index->afterAppend(length);
 }
 
 ColumnPtr ColumnMap::filter(const Filter & filt, ssize_t result_size_hint) const
 {
-    Columns new_columns(2);
-
-    for (size_t i = 0; i < 2; ++i)
-        new_columns[i] = columns[i]->filter(filt, result_size_hint);
-
-    return ColumnMap::create(new_columns);
+    auto filtered = nested->filter(filt, result_size_hint);
+    return ColumnMap::create(filtered);
 }
 
 ColumnPtr ColumnMap::permute(const Permutation & perm, size_t limit) const
 {
-    Columns new_columns(2);
-
-    for (size_t i = 0; i < 2; ++i)
-        new_columns[i] = columns[i]->permute(perm, limit);
-
-    return ColumnMap::create(new_columns);
+    auto permuted = nested->permute(perm, limit);
+    return ColumnMap::create(std::move(permuted));
 }
 
 ColumnPtr ColumnMap::index(const IColumn & indexes, size_t limit) const
 {
-    Columns new_columns(2);
-
-    for (size_t i = 0; i < 2; ++i)
-        new_columns[i] = columns[i]->index(indexes, limit);
-
-    return ColumnMap::create(new_columns);
+    auto res = nested->index(indexes, limit);
+    return ColumnMap::create(std::move(res));
 }
 
 ColumnPtr ColumnMap::replicate(const Offsets & offsets) const
 {
-    Columns new_columns(2);
-
-    for (size_t i = 0; i < 2; ++i)
-        new_columns[i] = columns[i]->replicate(offsets);
-
-    return ColumnMap::create(new_columns);
+    auto replicated = nested->replicate(offsets);
+    return ColumnMap::create(std::move(replicated));
 }
 
 MutableColumns ColumnMap::scatter(ColumnIndex num_columns, const Selector & selector) const
 {
-    std::vector<MutableColumns> scattered_map_elements(2);
-
-    for (size_t map_element_idx = 0; map_element_idx < 2; ++map_element_idx)
-        scattered_map_elements[map_element_idx] = columns[map_element_idx]->scatter(num_columns, selector);
-
-    MutableColumns res(num_columns);
-
-    for (size_t scattered_idx = 0; scattered_idx < num_columns; ++scattered_idx)
-    {
-        MutableColumns new_columns(2);
-        for (size_t map_element_idx = 0; map_element_idx < 2; ++map_element_idx)
-            new_columns[map_element_idx] = std::move(scattered_map_elements[map_element_idx][scattered_idx]);
-        res[scattered_idx] = ColumnMap::create(std::move(new_columns));
-    }
+    auto scattered_columns = nested->scatter(num_columns, selector);
+    MutableColumns res;
+    res.reserve(num_columns);
+    for (auto && scattered : scattered_columns)
+        res.push_back(ColumnMap::create(std::move(scattered)));
 
     return res;
 }
 
 int ColumnMap::compareAt(size_t n, size_t m, const IColumn & rhs, int nan_direction_hint) const
 {
-    for (size_t i = 0; i < 2; ++i)
-        if (int res = columns[i]->compareAt(n, m, *assert_cast<const ColumnMap &>(rhs).columns[i], nan_direction_hint))
-            return res;
-
-    return 0;
+    const auto & rhs_map = assert_cast<const ColumnMap &>(rhs);
+    return nested->compareAt(n, m, rhs_map.getNestedColumn(), nan_direction_hint);
 }
 
 void ColumnMap::compareColumn(const IColumn & rhs, size_t rhs_row_num,
@@ -261,136 +646,96 @@ void ColumnMap::compareColumn(const IColumn & rhs, size_t rhs_row_num,
                                         compare_results, direction, nan_direction_hint);
 }
 
-template <bool positive>
-struct ColumnMap::Less
-{
-    MapColumns columns;
-    int nan_direction_hint;
-
-    Less(const MapColumns & columns_, int nan_direction_hint_)
-        : columns(columns_), nan_direction_hint(nan_direction_hint_)
-    {
-    }
-
-    bool operator() (size_t a, size_t b) const
-    {
-        for (const auto & column : columns)
-        {
-            int res = column->compareAt(a, b, *column, nan_direction_hint);
-            if (res < 0)
-                return positive;
-            else if (res > 0)
-                return !positive;
-        }
-        return false;
-    }
-};
-
 void ColumnMap::getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const
 {
-    size_t rows = size();
-    res.resize(rows);
-    for (size_t i = 0; i < rows; ++i)
-        res[i] = i;
-
-    if (limit >= rows)
-        limit = 0;
-
-    if (limit)
-    {
-        if (reverse)
-            std::partial_sort(res.begin(), res.begin() + limit, res.end(), Less<false>(columns, nan_direction_hint));
-        else
-            std::partial_sort(res.begin(), res.begin() + limit, res.end(), Less<true>(columns, nan_direction_hint));
-    }
-    else
-    {
-        if (reverse)
-            std::sort(res.begin(), res.end(), Less<false>(columns, nan_direction_hint));
-        else
-            std::sort(res.begin(), res.end(), Less<true>(columns, nan_direction_hint));
-    }
+    nested->getPermutation(reverse, limit, nan_direction_hint, res);
 }
 
 void ColumnMap::updatePermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res, EqualRanges & equal_range) const
 {
-    for (const auto& column : columns)
-    {
-        column->updatePermutation(reverse, limit, nan_direction_hint, res, equal_range);
-        while (limit && !equal_range.empty() && limit <= equal_range.back().first)
-            equal_range.pop_back();
-
-        if (equal_range.empty())
-            break;
-    }
+    nested->updatePermutation(reverse, limit, nan_direction_hint, res, equal_range);
 }
 
 void ColumnMap::gather(ColumnGathererStream & gatherer)
 {
     gatherer.gather(*this);
+    key_index->rebuild();
 }
 
 void ColumnMap::reserve(size_t n)
 {
-    for (size_t i = 0; i < 2; ++i)
-        getColumn(i).reserve(n);
+    nested->reserve(n);
 }
 
 size_t ColumnMap::byteSize() const
 {
-    size_t res = 0;
-    for (const auto & column : columns)
-        res += column->byteSize();
-    return res;
+    return nested->byteSize();
+}
+
+size_t ColumnMap::byteSizeAt(size_t n) const
+{
+    return nested->byteSizeAt(n);
 }
 
 size_t ColumnMap::allocatedBytes() const
 {
-    size_t res = 0;
-    for (const auto & column : columns)
-        res += column->allocatedBytes();
-    return res;
+    return nested->allocatedBytes();
 }
 
 void ColumnMap::protect()
 {
-    for (auto & column : columns)
-        column->protect();
+    nested->protect();
 }
 
 void ColumnMap::getExtremes(Field & min, Field & max) const
 {
-    Map min_map(2);
-    Map max_map(2);
-
-    columns[0]->getExtremes(min_map[0], max_map[0]);
-    columns[1]->getExtremes(min_map[1], max_map[1]);
-
-    min = min_map;
-    max = max_map;
+    nested->getExtremes(min, max);
 }
 
 void ColumnMap::forEachSubcolumn(ColumnCallback callback)
 {
-    for (auto & column : columns)
-        callback(column);
+    nested->forEachSubcolumn(callback);
+    // NOTE: ICOlumn::dumpStructure() would cause a full index rebuild and hence tanks the performance,
+    // but since it is a debugging tool we don't care much.
+    rebuildIndex();
 }
 
 bool ColumnMap::structureEquals(const IColumn & rhs) const
 {
     if (const auto * rhs_map = typeid_cast<const ColumnMap *>(&rhs))
+        return nested->structureEquals(*rhs_map->nested);
+    return false;
+}
+
+void ColumnMap::rebuildIndex()
+{
+    // Since this usually called after modifying columns from outside, it is safer to assume that caller
+    // might have replaced keys and values columns with something else, hence do a full-reset.
+    const auto & kv_tuple = getNestedData();
+    key_index = makeIndex(stripNullable(kv_tuple.getColumn(0)), kv_tuple.getColumn(1), getNestedColumn().getOffsets());
+}
+
+bool ColumnMap::rebuildIndexDueToCOW()
+{
+    // Rebuilds index if shared key or value columns were cloned on modification by COWHelper,
+    // hence index now refers to the wrong columns internally.
+
+    const auto & kv_tuple = getNestedData();
+    if (key_index->needsRebuild(stripNullable(kv_tuple.getColumn(0)), kv_tuple.getColumn(1), getNestedColumn().getOffsets()))
     {
-        if (rhs_map->columns.size() != 2)
-            return false;
-
-        for (const auto i : ext::range(0, 2))
-            if (!columns[i]->structureEquals(*rhs_map->columns[i]))
-                return false;
-
+        rebuildIndex();
         return true;
     }
-    else
-        return false;
+
+    return false;
+}
+
+ColumnPtr ColumnMap::findAll(const IColumn & keys, size_t rows_count) const
+{
+    if (unlikely(rows_count > nested->size() || rows_count > keys.size()))
+        throw Exception("Too many rows for ColumnMap", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+
+    return key_index->findAll(keys, rows_count);
 }
 
 }

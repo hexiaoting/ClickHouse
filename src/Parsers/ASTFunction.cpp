@@ -1,14 +1,15 @@
-#include <Common/typeid_cast.h>
-#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTFunction.h>
-#include <Parsers/ASTWithAlias.h>
-#include <Parsers/ASTSubquery.h>
-#include <Parsers/ASTExpressionList.h>
-#include <IO/WriteHelpers.h>
-#include <IO/WriteBufferFromString.h>
-#include <Common/SipHash.h>
-#include <IO/Operators.h>
 
+#include <Common/SipHash.h>
+#include <Common/typeid_cast.h>
+#include <IO/Operators.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <Parsers/ASTExpressionList.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTWithAlias.h>
 
 namespace DB
 {
@@ -29,14 +30,25 @@ void ASTFunction::appendColumnNameImpl(WriteBuffer & ostr) const
         writeChar(')', ostr);
     }
 
-    writeChar(name == "map" ? '{' : '(', ostr);
-    for (auto it = arguments->children.begin(); it != arguments->children.end(); ++it)
+    writeChar('(', ostr);
+    if (arguments)
+        for (auto it = arguments->children.begin(); it != arguments->children.end(); ++it)
+        {
+            if (it != arguments->children.begin())
+                writeCString(", ", ostr);
+            (*it)->appendColumnName(ostr);
+        }
+    writeChar(')', ostr);
+
+    if (is_window_function)
     {
-        if (it != arguments->children.begin())
-            writeCString(", ", ostr);
-        (*it)->appendColumnName(ostr);
+        writeCString(" OVER (", ostr);
+        FormatSettings settings{ostr, true /* one_line */};
+        FormatState state;
+        FormatStateStacked frame;
+        appendWindowDescription(settings, state, frame);
+        writeCString(")", ostr);
     }
-    writeChar(name == "map" ? '}' : ')', ostr);
 }
 
 /** Get the text that identifies this element. */
@@ -53,6 +65,24 @@ ASTPtr ASTFunction::clone() const
     if (arguments) { res->arguments = arguments->clone(); res->children.push_back(res->arguments); }
     if (parameters) { res->parameters = parameters->clone(); res->children.push_back(res->parameters); }
 
+    if (window_name)
+    {
+        res->window_name = window_name->clone();
+        res->children.push_back(res->window_name);
+    }
+
+    if (window_partition_by)
+    {
+        res->window_partition_by = window_partition_by->clone();
+        res->children.push_back(res->window_partition_by);
+    }
+
+    if (window_order_by)
+    {
+        res->window_order_by = window_order_by->clone();
+        res->children.push_back(res->window_order_by);
+    }
+
     return res;
 }
 
@@ -62,6 +92,35 @@ void ASTFunction::updateTreeHashImpl(SipHash & hash_state) const
     hash_state.update(name.size());
     hash_state.update(name);
     IAST::updateTreeHashImpl(hash_state);
+}
+
+
+ASTPtr ASTFunction::toLiteral() const
+{
+    if (!arguments) return {};
+
+    if (name == "array")
+    {
+        Array array;
+
+        for (const auto & arg : arguments->children)
+        {
+            if (auto * literal = arg->as<ASTLiteral>())
+                array.push_back(literal->value);
+            else if (auto * func = arg->as<ASTFunction>())
+            {
+                if (auto func_literal = func->toLiteral())
+                    array.push_back(func_literal->as<ASTLiteral>()->value);
+            }
+            else
+                /// Some of the Array arguments is not literal
+                return {};
+        }
+
+        return std::make_shared<ASTLiteral>(array);
+    }
+
+    return {};
 }
 
 
@@ -381,41 +440,91 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
         }
     }
 
-    if (!written)
+    if (written)
     {
-        settings.ostr << (settings.hilite ? hilite_function : "") << name;
+        return;
+    }
 
-        if (parameters)
+    settings.ostr << (settings.hilite ? hilite_function : "") << name;
+
+    if (parameters)
+    {
+        settings.ostr << '(' << (settings.hilite ? hilite_none : "");
+        parameters->formatImpl(settings, state, nested_dont_need_parens);
+        settings.ostr << (settings.hilite ? hilite_function : "") << ')';
+    }
+
+    if ((arguments && !arguments->children.empty()) || !no_empty_args)
+        settings.ostr << '(' << (settings.hilite ? hilite_none : "");
+
+    if (arguments)
+    {
+        bool special_hilite_regexp = settings.hilite
+            && (name == "match" || name == "extract" || name == "extractAll" || name == "replaceRegexpOne"
+                || name == "replaceRegexpAll");
+
+        for (size_t i = 0, size = arguments->children.size(); i < size; ++i)
         {
-            settings.ostr << '(' << (settings.hilite ? hilite_none : "");
-            parameters->formatImpl(settings, state, nested_dont_need_parens);
-            settings.ostr << (settings.hilite ? hilite_function : "") << ')';
+            if (i != 0)
+                settings.ostr << ", ";
+
+            bool special_hilite = false;
+            if (i == 1 && special_hilite_regexp)
+                special_hilite = highlightStringLiteralWithMetacharacters(arguments->children[i], settings, "|()^$.[]?*+{:-");
+
+            if (!special_hilite)
+                arguments->children[i]->formatImpl(settings, state, nested_dont_need_parens);
         }
+    }
 
-        if (arguments)
-        {
-            settings.ostr << '(' << (settings.hilite ? hilite_none : "");
+    if ((arguments && !arguments->children.empty()) || !no_empty_args)
+        settings.ostr << (settings.hilite ? hilite_function : "") << ')';
 
-            bool special_hilite_regexp = settings.hilite
-                && (name == "match" || name == "extract" || name == "extractAll" || name == "replaceRegexpOne" || name == "replaceRegexpAll");
+    settings.ostr << (settings.hilite ? hilite_none : "");
 
-            for (size_t i = 0, size = arguments->children.size(); i < size; ++i)
-            {
-                if (i != 0)
-                    settings.ostr << ", ";
+    if (!is_window_function)
+    {
+        return;
+    }
 
-                bool special_hilite = false;
-                if (i == 1 && special_hilite_regexp)
-                    special_hilite = highlightStringLiteralWithMetacharacters(arguments->children[i], settings, "|()^$.[]?*+{:-");
+    settings.ostr << " OVER (";
+    appendWindowDescription(settings, state, nested_dont_need_parens);
+    settings.ostr << ")";
+}
 
-                if (!special_hilite)
-                    arguments->children[i]->formatImpl(settings, state, nested_dont_need_parens);
-            }
+std::string ASTFunction::getWindowDescription() const
+{
+    WriteBufferFromOwnString ostr;
+    FormatSettings settings{ostr, true /* one_line */};
+    FormatState state;
+    FormatStateStacked frame;
+    appendWindowDescription(settings, state, frame);
+    return ostr.str();
+}
 
-            settings.ostr << (settings.hilite ? hilite_function : "") << ')';
-        }
+void ASTFunction::appendWindowDescription(const FormatSettings & settings,
+    FormatState & state, FormatStateStacked frame) const
+{
+    if (!is_window_function)
+    {
+        return;
+    }
 
-        settings.ostr << (settings.hilite ? hilite_none : "");
+    if (window_partition_by)
+    {
+        settings.ostr << "PARTITION BY ";
+        window_partition_by->formatImpl(settings, state, frame);
+    }
+
+    if (window_partition_by && window_order_by)
+    {
+        settings.ostr << " ";
+    }
+
+    if (window_order_by)
+    {
+        settings.ostr << "ORDER BY ";
+        window_order_by->formatImpl(settings, state, frame);
     }
 }
 
